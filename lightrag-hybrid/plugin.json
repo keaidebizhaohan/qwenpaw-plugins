@@ -1,0 +1,22 @@
+{
+  "id": "lightrag-hybrid-tool",
+  "name": "LightRAG Hybrid Query",
+  "version": "1.2.0",
+  "type": "tool",
+  "description": "Dual knowledge-graph retrieval combining entity-focused Local and relationship-focused Global search",
+  "description_i18n": {"zh-CN": "知识图谱实体及关系双路检索，同时兼顾具体实体细节和全局关联", "en-US": "Dual knowledge-graph retrieval combining entity-focused Local and relationship-focused Global search"},
+  "author": "bzh",
+  "entry": {"backend": "plugin.py"},
+  "dependencies": ["httpx>=0.27.0"],
+  "qwenpaw_version": {"min": "2.2.0", "max": "3.0.0"},
+  "meta": {
+    "tools": [{
+      "name": "lightrag_hybrid_query",
+      "description": "知识图谱实体与关系双路检索（Local + Global），同时兼顾具体实体细节和全局关联；问题既需要对象事实又需要关系背景时使用。",
+      "icon": "🔀",
+      "category": "knowledge",
+      "requires_config": false,
+      "config_fields": []
+    }]
+  }
+}

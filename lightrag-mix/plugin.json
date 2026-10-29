@@ -1,0 +1,22 @@
+{
+  "id": "lightrag-mix-tool",
+  "name": "LightRAG Mix Query",
+  "version": "1.2.0",
+  "type": "tool",
+  "description": "Three-way retrieval combining original text chunks, knowledge-graph entities, and relationships for maximum coverage",
+  "description_i18n": {"zh-CN": "原始 Chunk 向量、知识图谱实体及关系三路混合检索，覆盖最全面", "en-US": "Three-way retrieval combining original text chunks, knowledge-graph entities, and relationships for maximum coverage"},
+  "author": "bzh",
+  "entry": {"backend": "plugin.py"},
+  "dependencies": ["httpx>=0.27.0"],
+  "qwenpaw_version": {"min": "2.2.0", "max": "3.0.0"},
+  "meta": {
+    "tools": [{
+      "name": "lightrag_mix_query",
+      "description": "原始 Chunk 向量 + 知识图谱实体 + 关系三路混合检索（Naive + Local + Global）。覆盖最全面，适合复杂综合问题、多证据回答或模式不明确时优先使用。",
+      "icon": "🧠",
+      "category": "knowledge",
+      "requires_config": false,
+      "config_fields": []
+    }]
+  }
+}

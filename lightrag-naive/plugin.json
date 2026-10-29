@@ -1,0 +1,22 @@
+{
+  "id": "lightrag-naive-tool",
+  "name": "LightRAG Naive Query",
+  "version": "1.2.0",
+  "type": "tool",
+  "description": "Original text-chunk vector retrieval without knowledge-graph retrieval; best for exact passages, source wording, attachments, and document details",
+  "description_i18n": {"zh-CN": "原始 Chunk 向量检索，不使用知识图谱；适合查附件原文、精确措辞、具体段落和文档细节", "en-US": "Original text-chunk vector retrieval without knowledge-graph retrieval; best for exact passages, source wording, attachments, and document details"},
+  "author": "bzh",
+  "entry": {"backend": "plugin.py"},
+  "dependencies": ["httpx>=0.27.0"],
+  "qwenpaw_version": {"min": "2.2.0", "max": "3.0.0"},
+  "meta": {
+    "tools": [{
+      "name": "lightrag_naive_query",
+      "description": "原始 Chunk 向量检索，不使用知识图谱。适合附件原文、精确措辞、具体段落、事实定位和文档细节；问题要求“原文怎么说”或“在哪一段”时优先使用。",
+      "icon": "📄",
+      "category": "knowledge",
+      "requires_config": false,
+      "config_fields": []
+    }]
+  }
+}
