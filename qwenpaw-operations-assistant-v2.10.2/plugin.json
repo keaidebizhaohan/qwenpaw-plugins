@@ -1,0 +1,19 @@
+{
+  "id": "service-channel",
+  "name": "运维助手",
+  "version": "2.10.2",
+  "type": "channel",
+  "description": "启用时注册当前 Agent 的聊天与文件上传地址，关闭时取消注册；运维助手调用固定关闭工具审批，并以 AG-UI SSE 返回回答和 CUSTOM/WIDGET 事件。",
+  "author": "QwenPaw user plugin",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.2.0",
+    "max": "3.0.0"
+  },
+  "meta": {
+    "channel": "operations-assistant"
+  }
+}

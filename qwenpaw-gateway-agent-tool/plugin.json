@@ -1,0 +1,71 @@
+{
+  "id": "gateway-agent-tool",
+  "name": "K8s Agent 调用工具",
+  "version": "1.0.0",
+  "type": "tool",
+  "description": "让当前 QwenPaw Agent 调用经 JiuwenSwarm Gateway 发布到 Kubernetes 的 Agent，并取得最终回答。",
+  "author": "QwenPaw user plugin",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.2.0",
+    "max": "3.0.0"
+  },
+  "meta": {
+    "tools": [
+      {
+        "name": "call_k8s_agent",
+        "description": "调用经 JiuwenSwarm Gateway 发布到 Kubernetes 的指定 Agent。根据 AGENTS.md 中维护的 Gateway 地址、Bot ID 和用途传入问题，并返回远程 Agent 的最终回答。",
+        "icon": "🌉",
+        "category": "network",
+        "requires_config": false,
+        "config_fields": [
+          {
+            "name": "authorization_header",
+            "label": "默认 Authorization 请求头",
+            "type": "password",
+            "required": false,
+            "default": "",
+            "placeholder": "Bearer token（Gateway 不认证则留空）",
+            "help": "可选。填写完整 Authorization 请求头值；不会作为工具参数暴露给 Agent。"
+          },
+          {
+            "name": "default_user_id",
+            "label": "默认 Gateway User ID",
+            "type": "text",
+            "required": false,
+            "default": "qwenpaw-gateway-caller"
+          },
+          {
+            "name": "default_group_id",
+            "label": "默认 Gateway Group ID",
+            "type": "text",
+            "required": false,
+            "default": "default"
+          },
+          {
+            "name": "timeout_seconds",
+            "label": "Gateway 最大处理时间（秒）",
+            "type": "number",
+            "required": false,
+            "default": 1800,
+            "min": 10,
+            "max": 7200
+          },
+          {
+            "name": "max_answer_chars",
+            "label": "最大回答字符数",
+            "type": "number",
+            "required": false,
+            "default": 100000,
+            "min": 1000,
+            "max": 1000000,
+            "help": "避免远程回答过大占满当前 Agent 上下文；超出时截断。"
+          }
+        ]
+      }
+    ]
+  }
+}

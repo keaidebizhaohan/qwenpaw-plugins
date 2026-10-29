@@ -1,0 +1,75 @@
+{
+  "id": "remote-qwenpaw-agent-tool",
+  "name": "远程 QwenPaw Agent 调用工具",
+  "version": "1.0.0",
+  "type": "tool",
+  "description": "让当前 Agent 调用其他 QwenPaw 服务中的指定 Agent，并取得最终回答。",
+  "author": "QwenPaw user plugin",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.2.0",
+    "max": "3.0.0"
+  },
+  "meta": {
+    "tools": [
+      {
+        "name": "call_remote_qwenpaw_agent",
+        "description": "调用另一套 QwenPaw 服务中的指定 Agent。根据 AGENTS.md 中维护的远程服务地址和 Agent ID，传入问题并返回远程 Agent 的最终回答。",
+        "icon": "🤝",
+        "category": "network",
+        "requires_config": false,
+        "config_fields": [
+          {
+            "name": "authorization_header",
+            "label": "默认 Authorization 请求头",
+            "type": "password",
+            "required": false,
+            "default": "",
+            "placeholder": "Bearer token（目标服务不认证则留空）",
+            "help": "可选。填写完整 Authorization 请求头值；不会作为工具参数暴露给 Agent。"
+          },
+          {
+            "name": "timeout_seconds",
+            "label": "远程 Agent 最大处理时间（秒）",
+            "type": "number",
+            "required": false,
+            "default": 1800,
+            "min": 10,
+            "max": 7200
+          },
+          {
+            "name": "poll_interval_ms",
+            "label": "任务轮询间隔（毫秒）",
+            "type": "number",
+            "required": false,
+            "default": 500,
+            "min": 100,
+            "max": 5000
+          },
+          {
+            "name": "default_user_id",
+            "label": "默认远程 User ID",
+            "type": "text",
+            "required": false,
+            "default": "qwenpaw-remote-caller",
+            "help": "调用工具时没有传 user_id 时使用。"
+          },
+          {
+            "name": "max_answer_chars",
+            "label": "最大回答字符数",
+            "type": "number",
+            "required": false,
+            "default": 100000,
+            "min": 1000,
+            "max": 1000000,
+            "help": "避免远程回答过大占满当前 Agent 上下文；超出时截断。"
+          }
+        ]
+      }
+    ]
+  }
+}
+

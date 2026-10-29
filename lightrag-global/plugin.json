@@ -1,0 +1,22 @@
+{
+  "id": "lightrag-global-tool",
+  "name": "LightRAG Global Query",
+  "version": "1.2.0",
+  "type": "tool",
+  "description": "Knowledge-graph relationship-first retrieval emphasizing cross-entity relationships, global themes, and reasoning",
+  "description_i18n": {"zh-CN": "知识图谱关系优先检索，强调跨实体关系、全局主题和综合推理", "en-US": "Knowledge-graph relationship-first retrieval emphasizing cross-entity relationships, global themes, and reasoning"},
+  "author": "bzh",
+  "entry": {"backend": "plugin.py"},
+  "dependencies": ["httpx>=0.27.0"],
+  "qwenpaw_version": {"min": "2.2.0", "max": "3.0.0"},
+  "meta": {
+    "tools": [{
+      "name": "lightrag_global_query",
+      "description": "知识图谱关系优先检索，强调跨实体关系、全局主题与综合推理。适合趋势、关联、整体结构、跨文档总结，以及“为什么”或“有什么联系”等全局问题。",
+      "icon": "🌐",
+      "category": "knowledge",
+      "requires_config": false,
+      "config_fields": []
+    }]
+  }
+}

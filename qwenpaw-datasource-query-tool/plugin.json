@@ -1,0 +1,74 @@
+{
+  "id": "datasource-query-tool",
+  "name": "数据查询工具",
+  "version": "1.0.2",
+  "type": "tool",
+  "description": "根据数据源范围调用市场或自定义数据源 SQL 查询接口。",
+  "author": "QwenPaw user plugin",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.2.0",
+    "max": "3.0.0"
+  },
+  "meta": {
+    "tools": [
+      {
+        "name": "query_datasource",
+        "description": "当需要通过指定数据源执行查询语句时调用。传入数据源名称、SQL 和范围；MARKET 查询市场数据源，CUSTOM 查询自定义数据源。",
+        "icon": "🗄️",
+        "category": "data",
+        "requires_config": true,
+        "config_fields": [
+          {
+            "name": "market_url",
+            "label": "市场数据源接口 URL",
+            "type": "text",
+            "required": true,
+            "default": "http://10.12.40.35:7055/market/datasource/execute-sql",
+            "placeholder": "http://host:port/market/datasource/execute-sql",
+            "help": "scope=MARKET 时调用，可在接口地址变更后直接修改。"
+          },
+          {
+            "name": "custom_url",
+            "label": "自定义数据源接口 URL",
+            "type": "text",
+            "required": true,
+            "default": "http://10.12.40.35:7055/custom/datasource/execute-sql",
+            "placeholder": "http://host:port/custom/datasource/execute-sql",
+            "help": "scope=CUSTOM 时调用，可在接口地址变更后直接修改。"
+          },
+          {
+            "name": "timeout_seconds",
+            "label": "请求超时（秒）",
+            "type": "number",
+            "required": false,
+            "default": 30,
+            "min": 1,
+            "max": 600
+          },
+          {
+            "name": "read_only",
+            "label": "仅允许只读 SQL",
+            "type": "boolean",
+            "required": false,
+            "default": true,
+            "help": "建议保持开启，阻止 INSERT、UPDATE、DELETE、DROP 等写入或结构变更语句。"
+          },
+          {
+            "name": "max_response_chars",
+            "label": "最大返回字符数",
+            "type": "number",
+            "required": false,
+            "default": 100000,
+            "min": 1000,
+            "max": 1000000,
+            "help": "防止超大查询结果占满 Agent 上下文；超出后会截断。"
+          }
+        ]
+      }
+    ]
+  }
+}
