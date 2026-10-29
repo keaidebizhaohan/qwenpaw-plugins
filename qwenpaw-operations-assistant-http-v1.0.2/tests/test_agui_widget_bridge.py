@@ -38,6 +38,102 @@ def make_bridge():
 
 
 class AgUiWidgetBridgeTest(unittest.TestCase):
+    def test_embedded_tool_output_becomes_agui_tool_call_result(self):
+        bridge = make_bridge()
+        events = bridge.convert(
+            {
+                "id": "msg-tool-result-1",
+                "type": "plugin_call_output",
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "data",
+                        "delta": False,
+                        "status": "completed",
+                        "object": "content",
+                        # 真实 QwenPaw 数据中这里可能就是 null。
+                        "msg_id": None,
+                        "data": {
+                            "call_id": "call-1",
+                            "name": "get_current_time",
+                            "output": "2026-10-29 16:03:34 Asia/Shanghai",
+                            "state": "success",
+                        },
+                    },
+                ],
+                "status": "completed",
+                "object": "message",
+            },
+        )
+
+        self.assertEqual(len(events), 1)
+        result = events[0]
+        self.assertEqual(result["type"], "TOOL_CALL_RESULT")
+        self.assertEqual(result["toolCallId"], "call-1")
+        self.assertEqual(result["messageId"], "msg-tool-result-1")
+        self.assertEqual(
+            result["content"],
+            "2026-10-29 16:03:34 Asia/Shanghai",
+        )
+        self.assertEqual(result["role"], "tool")
+        self.assertEqual(result["metadata"]["toolState"], "success")
+        self.assertIs(result["metadata"]["success"], True)
+
+    def test_false_tool_state_still_emits_failure_result(self):
+        bridge = make_bridge()
+        events = bridge.convert(
+            {
+                "id": "msg-tool-result-failed",
+                "type": "plugin_call_output",
+                "content": [
+                    {
+                        "type": "data",
+                        "delta": False,
+                        "status": "failed",
+                        "data": {
+                            "call_id": "call-failed",
+                            "output": "远程工具执行失败",
+                            "state": False,
+                        },
+                    },
+                ],
+                "status": "failed",
+                "object": "message",
+            },
+        )
+
+        self.assertEqual(len(events), 1)
+        result = events[0]
+        self.assertEqual(result["content"], "远程工具执行失败")
+        self.assertIs(result["metadata"]["toolState"], False)
+        self.assertIs(result["metadata"]["success"], False)
+
+    def test_failed_tool_without_output_uses_error_message(self):
+        bridge = make_bridge()
+        events = bridge.convert(
+            {
+                "id": "msg-tool-error",
+                "type": "plugin_call_output",
+                "content": [
+                    {
+                        "type": "data",
+                        "delta": False,
+                        "status": "completed",
+                        "data": {
+                            "call_id": "call-error",
+                            "message": "连接远程服务失败",
+                            "state": "error",
+                        },
+                    },
+                ],
+                "status": "completed",
+                "object": "message",
+            },
+        )
+
+        self.assertEqual(events[0]["content"], "连接远程服务失败")
+        self.assertIs(events[0]["metadata"]["success"], False)
+
     def test_custom_widget_event_and_clean_answer(self):
         bridge = make_bridge()
         events = []

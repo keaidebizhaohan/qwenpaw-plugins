@@ -182,6 +182,48 @@ def _text_preview(value: Any, limit: int) -> str:
     return text[:limit] + "..."
 
 
+def _tool_result_succeeded(value: Any) -> bool:
+    """把 QwenPaw 工具结果的 state 统一转换为成功标记。
+
+    不同工具可能返回字符串（success/failed/error）或布尔值。未知或缺失
+    state 沿用 QwenPaw 的兼容行为，视为成功；明确的失败状态才标记失败。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True
+    normalized = str(_enum_value(value)).strip().lower()
+    return normalized not in {
+        "false",
+        "failed",
+        "failure",
+        "error",
+        "cancelled",
+        "canceled",
+        "denied",
+        "interrupted",
+    }
+
+
+def _tool_result_content(data: dict[str, Any], limit: int) -> str:
+    """读取真实工具输出；失败时也保证 AG-UI content 不为空。
+
+    正常结果优先使用 QwenPaw ``data.output``。部分失败工具只返回 error、
+    message 或 detail，因此依次回退；再没有可读错误时返回完整 data，避免
+    TOOL_CALL_RESULT 只剩一个空字符串。
+    """
+    value = data.get("output")
+    if value is None or value == "":
+        for key in ("error", "message", "detail"):
+            candidate = data.get(key)
+            if candidate is not None and candidate != "":
+                value = candidate
+                break
+    if value is None or value == "":
+        value = data
+    return _text_preview(value, limit)
+
+
 class _AgUiStreamBridge:
     """把 QwenPaw 原生流事件逐条转换为外部服务使用的 AG-UI 事件。"""
 
@@ -372,23 +414,69 @@ class _AgUiStreamBridge:
         data: dict[str, Any],
         status: str,
     ) -> list[dict[str, Any]]:
-        state = self.tool_results.setdefault(message_id, {"sent": False})
-        state["data"] = data
-        if status != "completed" or state["sent"] or not self.show_tool_results:
+        result_state = self.tool_results.setdefault(message_id, {"sent": False})
+        result_state["data"] = data
+        # 工具失败也是一次完整的工具执行结果，不能丢弃。只等待进行中的事件，
+        # completed/failed/cancelled 都属于可以发送给调用方的终态。
+        terminal = status in {"completed", "failed", "cancelled", "canceled"}
+        if not terminal or result_state["sent"] or not self.show_tool_results:
             return []
-        state["sent"] = True
-        content = _text_preview(
-            data.get("output", ""),
-            self.tool_result_max_length,
-        )
+        result_state["sent"] = True
+        tool_state = data.get("state")
+        succeeded = _tool_result_succeeded(tool_state)
+        content = _tool_result_content(data, self.tool_result_max_length)
         return [
             self.event(
                 "TOOL_CALL_RESULT",
                 toolCallId=str(data.get("call_id") or message_id),
                 messageId=message_id,
                 content=content,
+                role="tool",
+                metadata={
+                    **self.metadata,
+                    "toolState": tool_state,
+                    "success": succeeded,
+                },
             ),
         ]
+
+    def _embedded_data_events(
+        self,
+        message_id: str,
+        parent_type: str,
+        content: Any,
+        parent_status: str,
+    ) -> list[dict[str, Any]]:
+        """转换 message.content 中内嵌的工具参数或结果事件。
+
+        QwenPaw 的最终 ``plugin_call_output`` 消息会把真实结果放在
+        ``content[].data.output`` 中，而且该内嵌项的 msg_id 可能为 null。
+        因此必须使用外层 message.id 建立 AG-UI messageId，不能只等待随后
+        到来的独立 content 事件。
+        """
+        if not isinstance(content, list):
+            return []
+        events: list[dict[str, Any]] = []
+        for item in content:
+            if str(_enum_value(_value(item, "type")) or "") != "data":
+                continue
+            data = _as_dict(_value(item, "data", {}))
+            item_status = str(
+                _enum_value(_value(item, "status")) or parent_status,
+            )
+            if parent_type == "plugin_call":
+                events.extend(
+                    self._tool_call_events(
+                        message_id,
+                        data,
+                        bool(_value(item, "delta", False)),
+                    ),
+                )
+            elif parent_type == "plugin_call_output":
+                events.extend(
+                    self._tool_result_events(message_id, data, item_status),
+                )
+        return events
 
     def convert(self, raw_event: Any) -> list[dict[str, Any]]:
         """转换一个 QwenPaw 事件，可能生成零到多条 AG-UI 事件。"""
@@ -417,6 +505,13 @@ class _AgUiStreamBridge:
                 # Widget-only 回答因此不会产生空的文本消息。
                 self.last_answer_message_id = message_id
                 return []
+            if item_type in {"plugin_call", "plugin_call_output"}:
+                return self._embedded_data_events(
+                    message_id,
+                    item_type,
+                    _value(raw_event, "content", []),
+                    status,
+                )
             return []
 
         if object_type != "content":
@@ -521,7 +616,8 @@ async def _get_runtime(agent_id: str, ctx: Any) -> Any:
         show_tool_calls=True,
         show_tool_results=True,
         tool_call_max_length=200,
-        tool_result_max_length=500,
+        # AG-UI ToolCallResult.content 应携带实际完整 output；0 表示不截断。
+        tool_result_max_length=0,
     )
     return SimpleNamespace(
         channel="operations-assistant",

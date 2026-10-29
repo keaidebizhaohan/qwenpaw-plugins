@@ -1,7 +1,7 @@
 {
   "id": "operations-assistant-http",
   "name": "运维助手 HTTP API",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "general",
   "description": "提供运维助手聊天和文件上传 HTTP API，不依赖频道启停状态。",
   "author": "QwenPaw user plugin",
