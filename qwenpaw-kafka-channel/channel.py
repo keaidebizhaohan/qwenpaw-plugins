@@ -88,6 +88,7 @@ class KafkaChannel(BaseChannel):
         input_ssl_cafile: str = "",
         input_ssl_certfile: str = "",
         input_ssl_keyfile: str = "",
+        publish_to_downstream: bool = True,
         output_bootstrap_servers: str = "",
         output_topic: str = "",
         qwenpaw_producer_client_id: str = "qwenpaw-kafka-producer",
@@ -134,6 +135,9 @@ class KafkaChannel(BaseChannel):
         self.input_ssl_cafile = input_ssl_cafile
         self.input_ssl_certfile = input_ssl_certfile
         self.input_ssl_keyfile = input_ssl_keyfile
+        # The upstream consumer and Agent invocation stay active when this is
+        # disabled; only the downstream Kafka producer/publish step is skipped.
+        self.publish_to_downstream = publish_to_downstream
         self.output_bootstrap_servers = output_bootstrap_servers
         self.output_topic = output_topic
         self.qwenpaw_producer_client_id = (
@@ -258,6 +262,9 @@ class KafkaChannel(BaseChannel):
             input_ssl_keyfile=endpoint_text(
                 input_prefix, "ssl_keyfile", legacy_ssl_keyfile
             ),
+            publish_to_downstream=_boolean(
+                config, "publish_to_downstream", True
+            ),
             output_bootstrap_servers=endpoint_text(
                 output_prefix, "bootstrap_servers", legacy_bootstrap_servers
             ),
@@ -363,6 +370,9 @@ class KafkaChannel(BaseChannel):
                 "KAFKA_PRODUCER_BOOTSTRAP_SERVERS",
                 os.getenv("KAFKA_BOOTSTRAP_SERVERS", ""),
             ),
+            "publish_to_downstream": os.getenv(
+                "KAFKA_PUBLISH_TO_DOWNSTREAM", "1"
+            ),
             "output_topic": os.getenv("KAFKA_OUTPUT_TOPIC", ""),
             "qwenpaw_producer_client_id": os.getenv(
                 "KAFKA_QWENPAW_PRODUCER_CLIENT_ID",
@@ -402,15 +412,21 @@ class KafkaChannel(BaseChannel):
         return cls.from_config(process, config, on_reply_sent=on_reply_sent)
 
     def _validate_config(self) -> None:
+        required_settings = [
+            ("input_bootstrap_servers", self.input_bootstrap_servers),
+            ("input_topic", self.input_topic),
+            ("qwenpaw_consumer_group", self.group_id),
+        ]
+        if self.publish_to_downstream:
+            required_settings.extend(
+                [
+                    ("output_bootstrap_servers", self.output_bootstrap_servers),
+                    ("output_topic", self.output_topic),
+                ]
+            )
         missing = [
             name
-            for name, value in (
-                ("input_bootstrap_servers", self.input_bootstrap_servers),
-                ("input_topic", self.input_topic),
-                ("qwenpaw_consumer_group", self.group_id),
-                ("output_bootstrap_servers", self.output_bootstrap_servers),
-                ("output_topic", self.output_topic),
-            )
+            for name, value in required_settings
             if not value
         ]
         if missing:
@@ -418,20 +434,24 @@ class KafkaChannel(BaseChannel):
         if self.auto_offset_reset not in {"latest", "earliest"}:
             raise ValueError("auto_offset_reset must be latest or earliest")
         supported_protocols = {"PLAINTEXT", "SASL_PLAINTEXT", "SSL", "SASL_SSL"}
-        for role, protocol, username, password in (
+        connections = [
             (
                 "input",
                 self.input_security_protocol,
                 self.input_sasl_username,
                 self.input_sasl_password,
-            ),
-            (
-                "output",
-                self.output_security_protocol,
-                self.output_sasl_username,
-                self.output_sasl_password,
-            ),
-        ):
+            )
+        ]
+        if self.publish_to_downstream:
+            connections.append(
+                (
+                    "output",
+                    self.output_security_protocol,
+                    self.output_sasl_username,
+                    self.output_sasl_password,
+                )
+            )
+        for role, protocol, username, password in connections:
             if protocol not in supported_protocols:
                 raise ValueError(f"unsupported {role}_security_protocol: {protocol}")
             if protocol.startswith("SASL_") and (not username or not password):
@@ -522,12 +542,13 @@ class KafkaChannel(BaseChannel):
                 "aiokafka is not installed; reinstall the Kafka plugin dependencies"
             ) from exc
 
-        self._producer = AIOKafkaProducer(
-            **self._producer_connection_kwargs(),
-            client_id=self.qwenpaw_producer_client_id,
-            acks="all",
-            enable_idempotence=True,
-        )
+        if self.publish_to_downstream:
+            self._producer = AIOKafkaProducer(
+                **self._producer_connection_kwargs(),
+                client_id=self.qwenpaw_producer_client_id,
+                acks="all",
+                enable_idempotence=True,
+            )
         self._consumer = AIOKafkaConsumer(
             self.input_topic,
             **self._consumer_connection_kwargs(),
@@ -539,7 +560,8 @@ class KafkaChannel(BaseChannel):
         )
 
         try:
-            await self._producer.start()
+            if self._producer is not None:
+                await self._producer.start()
             await self._consumer.start()
         except Exception:
             await self._close_clients()
@@ -550,9 +572,10 @@ class KafkaChannel(BaseChannel):
         )
         logger.info(
             "Kafka channel started: input=%s producer_side_brokers=%s "
-            "output=%s consumer_side_brokers=%s group=%s",
+            "output_enabled=%s output=%s consumer_side_brokers=%s group=%s",
             self.input_topic,
             self.input_bootstrap_servers,
+            self.publish_to_downstream,
             self.output_topic,
             self.output_bootstrap_servers,
             self.group_id,
@@ -976,6 +999,8 @@ class KafkaChannel(BaseChannel):
         answer: str,
         details: list[dict[str, str]] | None = None,
     ) -> None:
+        if not self.publish_to_downstream:
+            return
         if self._producer is None:
             raise RuntimeError("Kafka producer is not connected")
         route = dict(meta or {})

@@ -1,7 +1,7 @@
 {
   "id": "kafka-channel",
   "name": "Kafka Channel",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "type": "channel",
   "description": "Consume upstream Kafka requests, invoke the Agent, and publish results to a downstream Kafka cluster.",
   "author": "QwenPaw user plugin",

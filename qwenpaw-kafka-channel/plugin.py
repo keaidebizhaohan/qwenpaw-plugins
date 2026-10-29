@@ -156,13 +156,26 @@ class KafkaChannelPlugin:
                 },
                 *_security_fields("producer", "上游", "Upstream"),
                 {
+                    "name": "publish_to_downstream",
+                    "label": {
+                        "zh": "是否开启下游",
+                        "en": "Downstream · Publish Agent Results",
+                    },
+                    "type": "switch",
+                    "default": True,
+                    "help": {
+                        "zh": "关闭后仍会监听上游 Kafka 并交给 Agent 处理，但不会连接下游 Kafka，也不会推送处理结果。处理成功后仍会提交上游 offset。",
+                        "en": "When disabled, upstream requests are still consumed and processed by the Agent, but no downstream Kafka connection or result publish is performed. Successfully processed upstream offsets are still committed.",
+                    },
+                },
+                {
                     "name": "consumer_bootstrap_servers",
                     "label": {
                         "zh": "下游 · Bootstrap Servers",
                         "en": "Downstream · Bootstrap Servers",
                     },
                     "type": "text",
-                    "required": True,
+                    "required": False,
                     "placeholder": "output-kafka-1:9092,output-kafka-2:9092",
                     "help": {
                         "zh": "Agent 处理结果要发送到的 Kafka 集群；可以与上游集群不同。",
@@ -176,7 +189,7 @@ class KafkaChannelPlugin:
                         "en": "Downstream · Default Reply Topic",
                     },
                     "type": "text",
-                    "required": True,
+                    "required": False,
                     "placeholder": "qwenpaw.agent.responses",
                     "help": {
                         "zh": "上游消息未提供 reply_to 时使用；动态 reply_to 指定的 Topic 也必须位于下游集群。",

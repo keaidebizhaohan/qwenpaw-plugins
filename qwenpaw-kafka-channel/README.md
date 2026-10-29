@@ -28,6 +28,7 @@ python -m pip install -r /Users/hanhan/Downloads/qwenpaw-kafka-channel/requireme
 | 上游 · 请求输入 | QwenPaw 消费组 | `qwenpaw-agent-default` | QwenPaw 消费请求时使用；每个 Agent 建议不同 |
 | 上游 · 请求输入 | QwenPaw Client ID | `qwenpaw-kafka-consumer` | 标识 QwenPaw 的请求监听客户端 |
 | 消息处理 | 最大并发处理数 | `5` | 最多同时交给 Agent 处理的请求数 |
+| 下游 · 响应输出 | 推送 Agent 处理结果 | 开启 | 关闭后只消费上游并交给 Agent 处理，不连接或推送下游 Kafka |
 | 下游 · 响应输出 | Bootstrap Servers | `downstream-kafka:9092` | Agent 结果发送到的 Kafka 集群，可以与上游不同 |
 | 下游 · 响应输出 | 默认回复 Topic | `qwenpaw.responses` | 没有 `reply_to` 时发送到这里 |
 | 下游 · 响应输出 | QwenPaw Client ID | `qwenpaw-kafka-producer` | QwenPaw 发送结果时使用 |
@@ -36,6 +37,10 @@ python -m pip install -r /Users/hanhan/Downloads/qwenpaw-kafka-channel/requireme
 Bootstrap Servers 和认证字段中填入相同内容。
 
 保存并启用后，该配置只绑定到当前选中的 Agent。
+
+如果关闭“下游 · 推送 Agent 处理结果”，插件仍会连接上游 Kafka、消费请求并调用 Agent；
+Agent 成功处理后会正常提交对应的上游 offset，但不会创建下游 Producer，也不会向下游
+Kafka 发送任何结果。此时下游 Bootstrap Servers、回复 Topic 和认证配置可以留空。
 
 ## 原样输入输出（默认开启）
 
@@ -148,7 +153,7 @@ responses.{message_id}
 - 默认最多同时处理 5 条消息；可通过页面的“消息处理 · 最大并发处理数”调整。
 - 并发任务可以按处理速度先后返回，因此下游回复顺序不保证与上游请求顺序一致。
 - 每个分区只提交从最早待处理消息开始、已经连续完成的 offset；后面的消息先完成不会误确认前面仍在处理的消息。
-- Agent 调用和下游发送都完成后，才会把对应消息标记为可提交。
+- 开启下游推送时，Agent 调用和下游发送都完成后，才会把对应消息标记为可提交；关闭时，Agent 调用完成后即可标记为可提交。
 - Kafka producer 开启 `acks=all` 和幂等发送。
 - 同一进程内缓存最近 10000 个已处理 `message_id`，减少“处理成功但 offset 提交失败”造成的重复 Agent 调用。
 - JSON 格式错误或没有文本字段的毒消息会记录错误并跳过，以免永久阻塞分区。

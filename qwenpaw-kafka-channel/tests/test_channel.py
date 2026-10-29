@@ -33,6 +33,7 @@ def make_channel() -> KafkaChannel:
     channel.message_id_field = "message_id"
     channel.correlation_id_field = "correlation_id"
     channel.output_topic = "responses.{sender_id}"
+    channel.publish_to_downstream = True
     channel.raw_input_output = False
     return channel
 
@@ -158,7 +159,39 @@ class FakeConsumer:
         self.commits.append(offsets)
 
 
+class FakeStartedConsumer:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.started = False
+        self.stopped = False
+        self.__class__.instances.append(self)
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
 class KafkaChannelSendingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_downstream_does_not_publish(self):
+        channel = make_channel()
+        channel.publish_to_downstream = False
+        channel._producer = None
+
+        await channel.send("ignored", "agent reply", {"sender_id": "user-1"})
+
+        self.assertIsNone(channel._producer)
+
     async def test_raw_mode_publishes_only_the_final_answer(self):
         channel = make_channel()
         channel.raw_input_output = True
@@ -232,6 +265,39 @@ class KafkaChannelSendingTests(unittest.IsolatedAsyncioTestCase):
         envelope = json.loads(value)
         self.assertEqual(envelope["reasoning"], "internal reasoning")
         self.assertEqual(envelope["answer"], "final answer")
+
+
+class KafkaChannelLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_downstream_starts_only_the_upstream_consumer(self):
+        FakeStartedConsumer.instances.clear()
+
+        def fail_if_producer_is_created(*args, **kwargs):
+            raise AssertionError("downstream producer must not be created")
+
+        channel = KafkaChannel.from_config(
+            lambda request: None,
+            {
+                "enabled": True,
+                "producer_bootstrap_servers": "request:9092",
+                "input_topic": "requests",
+                "qwenpaw_consumer_group": "agent-group",
+                "publish_to_downstream": False,
+            },
+        )
+        fake_aiokafka = SimpleNamespace(
+            AIOKafkaConsumer=FakeStartedConsumer,
+            AIOKafkaProducer=fail_if_producer_is_created,
+        )
+
+        with patch.dict(sys.modules, {"aiokafka": fake_aiokafka}):
+            await channel.start()
+            await asyncio.sleep(0)
+            await channel.stop()
+
+        self.assertEqual(len(FakeStartedConsumer.instances), 1)
+        self.assertTrue(FakeStartedConsumer.instances[0].started)
+        self.assertTrue(FakeStartedConsumer.instances[0].stopped)
+        self.assertIsNone(channel._producer)
 
 
 class KafkaConcurrentCommitTests(unittest.IsolatedAsyncioTestCase):
@@ -308,7 +374,25 @@ class KafkaSplitClusterConfigTests(unittest.TestCase):
         self.assertEqual(channel.output_bootstrap_servers, "response:9092")
         self.assertEqual(channel.group_id, "agent-group")
         self.assertTrue(channel.raw_input_output)
+        self.assertTrue(channel.publish_to_downstream)
         self.assertEqual(channel.max_concurrent_messages, 5)
+
+    def test_downstream_can_be_disabled_without_output_config(self):
+        channel = KafkaChannel.from_config(
+            lambda request: None,
+            {
+                "enabled": True,
+                "producer_bootstrap_servers": "request:9092",
+                "input_topic": "requests",
+                "qwenpaw_consumer_group": "agent-group",
+                "publish_to_downstream": False,
+            },
+        )
+
+        channel._validate_config()
+        self.assertFalse(channel.publish_to_downstream)
+        self.assertEqual(channel.output_bootstrap_servers, "")
+        self.assertEqual(channel.output_topic, "")
 
     def test_max_concurrency_can_be_configured(self):
         channel = KafkaChannel.from_config(
