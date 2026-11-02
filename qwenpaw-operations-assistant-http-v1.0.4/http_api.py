@@ -5,7 +5,8 @@
 
 本插件提供：
 
-- POST /chat：调用指定 Agent 并返回 AG-UI SSE；
+- POST /chat：无论 ``stream`` 为 true 还是 false 都返回 AG-UI SSE；
+  ``stream=false`` 会等待 Agent 完成后，再一次性逐帧输出完整思考和最终回答；
 - POST /chat/stop：按 Agent ID 和 Session ID 停止运行中的聊天；
 - POST /files：multipart 文件上传，返回 fileId 供聊天引用；
 - /chat 的 input 中支持 ``{"type": "file", "fileId": ...}`` 内容块；
@@ -71,6 +72,10 @@ class QwenPawChatRequest(BaseModel):
 
     # QwenPaw 消息数组，当前实现从中选取最后一条 user 文本消息。
     input: list[dict[str, Any]]
+
+    # true（默认）实时转发 AG-UI SSE；false 等待 QwenPaw 最终
+    # AgentResponse，再通过 SSE 输出最多一条思考 Chunk 和一条回答 Chunk。
+    stream: bool = True
 
 
 class StopChatRequest(BaseModel):
@@ -597,6 +602,83 @@ def _completed_answer(event: Any) -> str:
     return answers[-1] if answers else ""
 
 
+def _completed_message_text(message: Any) -> str:
+    """读取最终 AgentResponse 中一条消息的完整非增量文本。"""
+    content = _value(message, "content", [])
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if _enum_value(_value(item, "type")) != "text":
+            continue
+        # 最终 response.output 理论上都是 delta=false；显式过滤可以避免兼容
+        # 后端把早先的流式碎片也塞进最终响应时造成重复。
+        if bool(_value(item, "delta", False)):
+            continue
+        text = _value(item, "text", "")
+        if text:
+            parts.append(str(text))
+    return "".join(parts).strip()
+
+
+def _non_stream_agui_events(response: Any) -> list[dict[str, Any]]:
+    """把 QwenPaw 最终 AgentResponse 压缩为一到两条 AG-UI Chunk。
+
+    所有 reasoning 消息合并成第一条 REASONING_MESSAGE_CHUNK；最后一条完整
+    assistant message 作为 TEXT_MESSAGE_CHUNK。没有思考时只返回最终回答。
+    """
+    output = _value(response, "output", [])
+    if not isinstance(output, list):
+        return []
+
+    reasoning_parts: list[str] = []
+    reasoning_message_id = ""
+    answer = ""
+    answer_message_id = ""
+
+    for message in output:
+        role = str(_enum_value(_value(message, "role")) or "")
+        message_type = str(_enum_value(_value(message, "type")) or "")
+        text = _completed_message_text(message)
+        if not text:
+            continue
+
+        if message_type == "reasoning" and role in {"", "assistant"}:
+            if not reasoning_message_id:
+                reasoning_message_id = str(
+                    _value(message, "id") or f"msg-{uuid.uuid4()}",
+                )
+            reasoning_parts.append(text)
+            continue
+
+        if message_type == "message" and role in {"", "assistant"}:
+            # 最终 output 中可能存在多条历史助手消息，取最后一条作为回答。
+            answer = text
+            answer_message_id = str(
+                _value(message, "id") or f"msg-{uuid.uuid4()}",
+            )
+
+    events: list[dict[str, Any]] = []
+    if reasoning_parts:
+        events.append(
+            _event(
+                "REASONING_MESSAGE_CHUNK",
+                messageId=reasoning_message_id,
+                delta="\n".join(reasoning_parts),
+            ),
+        )
+    if answer:
+        events.append(
+            _event(
+                "TEXT_MESSAGE_CHUNK",
+                messageId=answer_message_id,
+                role="assistant",
+                delta=answer,
+            ),
+        )
+    return events
+
+
 async def _get_runtime(agent_id: str, ctx: Any) -> Any:
     """直接取得 Agent Workspace 并构造 HTTP 运行参数。
 
@@ -713,6 +795,84 @@ async def _ensure_visible_chat(
         name=name or "运维助手会话",
     )
     await manager.touch_chat(chat.id)
+
+
+async def _non_stream_agent(
+    payload: QwenPawChatRequest,
+    channel: Any,
+    ctx: Any,
+    file_entries: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """消费完整 QwenPaw 流，只返回最终 response 中的一到两条 AG-UI Chunk。"""
+    run_id = f"run-{uuid.uuid4()}"
+    run_key = (channel.agent_id, payload.session_id, run_id)
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        ACTIVE_RUNS[run_key] = current_task
+
+    try:
+        prompt = _latest_user_text(payload.input)
+        await _ensure_visible_chat(
+            payload,
+            channel,
+            ctx,
+            prompt,
+            file_entries or [],
+        )
+
+        final_response: Any = None
+        async with asyncio.timeout(channel.agent_timeout_seconds):
+            async for event in _stream_agent_request(
+                payload,
+                channel,
+                ctx,
+                prompt,
+                file_entries or [],
+            ):
+                if str(_enum_value(_value(event, "object")) or "") == "response":
+                    # 始终保留最后一个 response，而不是依赖它恰好位于倒数第几帧。
+                    final_response = event
+
+        if final_response is None:
+            raise HTTPException(
+                status_code=502,
+                detail="QwenPaw did not return a final AgentResponse",
+            )
+
+        events = _non_stream_agui_events(final_response)
+        if not any(event["type"] == "TEXT_MESSAGE_CHUNK" for event in events):
+            raise HTTPException(
+                status_code=502,
+                detail="QwenPaw final AgentResponse has no assistant answer",
+            )
+        return events
+    except asyncio.CancelledError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="QwenPaw Agent run was cancelled",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="QwenPaw Agent processing timed out",
+        ) from exc
+    finally:
+        if ACTIVE_RUNS.get(run_key) is current_task:
+            ACTIVE_RUNS.pop(run_key, None)
+
+
+async def _non_stream_sse(events: list[dict[str, Any]]):
+    """把已经收集完成的 AG-UI 事件逐帧输出为 SSE。
+
+    ``stream=false`` 只关闭 QwenPaw 中间增量的实时转发，不改变本插件对外的
+    ``text/event-stream`` 协议。事件已经由 ``_non_stream_agent`` 收集完整，
+    因此这里通常依次 yield 一条思考事件和一条最终回答事件。
+    """
+    for event in events:
+        yield _sse(event)
+        # 主动把执行权交还事件循环，使 StreamingResponse 有机会立即发送刚刚
+        # yield 的一帧，然后再请求下一帧，而不是在同一轮循环内连续处理完。
+        await asyncio.sleep(0)
 
 
 async def _stream_agent(
@@ -868,12 +1028,15 @@ async def chat(
     payload: QwenPawChatRequest,
     agent_id: str = Query(alias="agentId", min_length=1),
     ctx: Any = Depends(get_ctx),
-) -> StreamingResponse:
-    """聊天回调入口，调用绑定的 Agent 并返回 AG-UI SSE。
+) -> Any:
+    """聊天回调入口；两种模式都返回 AG-UI SSE。
 
     ``payload`` 来自 JSON 请求体；``ctx`` 由 FastAPI 先调用 QwenPaw 的
     ``get_ctx(request)`` 自动创建。
     插件从 ``?agentId=...`` 读取 Agent ID，并写入 QwenPaw 上下文。
+
+    ``stream=true`` 实时转发增量事件；``stream=false`` 先等待完整
+    AgentResponse，再把完整思考和最终回答作为一到两帧 SSE 输出。
     """
 
     # 等价理解：FastAPI 在进入本函数前，已经大致执行了下面这一步：
@@ -911,7 +1074,20 @@ async def chat(
                 "or a valid fileId file block"
             ),
         )
-    # 6. 将 _stream_agent 生成的 SSE 帧逐条写回调用方。
+    # 6. 非流式模式先在当前请求中等待 QwenPaw 执行完成，但对外仍使用 SSE。
+    #    调用方不会收到 QwenPaw 的中间增量，只会收到最终整理好的 1～2 帧。
+    if not payload.stream:
+        events = await _non_stream_agent(payload, channel, ctx, file_entries)
+        return StreamingResponse(
+            _non_stream_sse(events),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 7. 默认流式模式将 _stream_agent 生成的 SSE 帧逐条写回调用方。
     return StreamingResponse(
         _stream_agent(payload, channel, ctx, file_entries),
         media_type="text/event-stream",
