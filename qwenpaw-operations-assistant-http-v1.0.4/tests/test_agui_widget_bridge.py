@@ -203,7 +203,7 @@ class AgUiWidgetBridgeTest(unittest.TestCase):
         self.assertEqual("".join(deltas), "第一行\n第二行")
         self.assertEqual("".join(bridge.answer_parts), "第一行\n第二行")
 
-    def test_agent_request_always_disables_approval(self):
+    def test_agent_request_uses_configured_approval_policy(self):
         class FakeWorkspace:
             def __init__(self):
                 self.request = None
@@ -243,11 +243,75 @@ class AgUiWidgetBridgeTest(unittest.TestCase):
 
         self.assertEqual(asyncio.run(run()), [])
         self.assertIsNotNone(workspace.request)
-        self.assertEqual(
-            workspace.request.request_context,
-            {"approval_level": "off"},
-        )
+        self.assertIsNone(getattr(workspace.request, "request_context", None))
         self.assertEqual(workspace.request.channel, "operations-assistant")
+
+    def test_approval_uses_custom_event_without_widget_tag(self):
+        bridge = make_bridge()
+        pending = SimpleNamespace(
+            request_id="approval-1",
+            session_id="session-1",
+            root_session_id="session-1",
+            owner_agent_id="agent-1",
+            agent_id="agent-1",
+            tool_name="LightragGlobalQuery",
+            status="pending",
+            severity="HIGH",
+            findings_count=1,
+            result_summary="即将执行全局知识库查询",
+            created_at=100.0,
+            timeout_seconds=300.0,
+            extra={
+                "tool_call": {"input": {"query": "查询 CPU"}},
+                "display": {
+                    "tool_name": "LightRAG 全局查询",
+                    "tool_source": "policy",
+                    "exact_target": "query=查询 CPU",
+                    "similar_target": "query=*",
+                    "is_generalized": True,
+                },
+                "reasoning": "需要查询知识库",
+                "source_type": "tool_guard",
+            },
+        )
+        known = set()
+
+        events = HTTP_API._approval_custom_events(
+            bridge,
+            [pending],
+            known,
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "CUSTOM")
+        self.assertEqual(events[0]["name"], "APPROVAL")
+        self.assertEqual(events[0]["value"]["request_id"], "approval-1")
+        self.assertEqual(events[0]["value"]["root_session_id"], "session-1")
+        self.assertNotIn("session_id", events[0]["value"])
+        self.assertNotIn("component", events[0]["value"])
+        self.assertNotIn("event", events[0]["value"])
+        self.assertNotIn("status", events[0]["value"])
+        self.assertEqual(
+            events[0]["value"]["tool_name"],
+            "LightragGlobalQuery",
+        )
+        self.assertEqual(
+            events[0]["value"]["tool_params"],
+            {"query": "查询 CPU"},
+        )
+        self.assertEqual(events[0]["value"]["tool_source"], "policy")
+        self.assertTrue(events[0]["value"]["is_generalized"])
+
+        # 同一个 pending 在后续轮询中不会重复发送。
+        self.assertEqual(
+            HTTP_API._approval_custom_events(bridge, [pending], known),
+            [],
+        )
+        # 审批消失后不发送 resolved 事件，原聊天流直接继续。
+        self.assertEqual(
+            HTTP_API._approval_custom_events(bridge, [], known),
+            [],
+        )
 
 
 if __name__ == "__main__":

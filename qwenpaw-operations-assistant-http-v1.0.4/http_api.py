@@ -104,6 +104,66 @@ def _sse(event: dict[str, Any]) -> str:
     ) + "\n\n"
 
 
+def _approval_value(pending: Any) -> dict[str, Any]:
+    """把 QwenPaw 审批记录转换为稳定的 CUSTOM/APPROVAL value。"""
+    extra = getattr(pending, "extra", {})
+    if not isinstance(extra, dict):
+        extra = {}
+    display = extra.get("display", {})
+    if not isinstance(display, dict):
+        display = {}
+    tool_name = str(getattr(pending, "tool_name", "") or "")
+    return {
+        "request_id": str(getattr(pending, "request_id", "") or ""),
+        "root_session_id": str(
+            getattr(pending, "root_session_id", "") or "",
+        ),
+        "tool_name": tool_name,
+        "tool_display_name": str(display.get("tool_name") or tool_name),
+        "tool_source": str(display.get("tool_source") or "No rule hit"),
+        "severity": str(getattr(pending, "severity", "medium") or "medium"),
+        "findings_count": int(getattr(pending, "findings_count", 0) or 0),
+        "summary": str(getattr(pending, "result_summary", "") or ""),
+        "tool_params": extra.get("tool_call", {}).get("input", {})
+        if isinstance(extra.get("tool_call"), dict)
+        else {},
+        "reasoning": str(extra.get("reasoning") or ""),
+        "source_type": str(extra.get("source_type") or "tool_guard"),
+        "driver": extra.get("driver"),
+        "created_at": float(getattr(pending, "created_at", 0.0) or 0.0),
+        "timeout_seconds": float(
+            getattr(pending, "timeout_seconds", 300.0) or 300.0,
+        ),
+        "exact_target": str(display.get("exact_target") or ""),
+        "similar_target": str(display.get("similar_target") or ""),
+        "is_generalized": bool(display.get("is_generalized")),
+    }
+
+
+def _approval_custom_events(
+    bridge: Any,
+    pending: list[Any],
+    known: set[str],
+) -> list[dict[str, Any]]:
+    """生成新增审批事件，并按 request_id 去重。"""
+    events: list[dict[str, Any]] = []
+    for item in pending:
+        request_id = str(getattr(item, "request_id", "") or "")
+        if not request_id:
+            continue
+        if request_id in known:
+            continue
+        known.add(request_id)
+        events.append(
+            bridge.event(
+                "CUSTOM",
+                name="APPROVAL",
+                value=_approval_value(item),
+            ),
+        )
+    return events
+
+
 def _content_text(content: Any) -> str:
     """提取一条 message.content 中所有 text 类型内容。"""
     if isinstance(content, str):
@@ -719,10 +779,10 @@ async def _stream_agent_request(
     prompt: str,
     file_entries: list[dict[str, Any]],
 ):
-    """构造关闭审批的 AgentRequest，交给 workspace.stream_query。
+    """构造 AgentRequest，交给 workspace.stream_query。
 
-    纯文本和文件请求统一走本函数，确保每次运维助手调用都携带
-    ``request_context.approval_level=off``。存在文件时，content 中额外携带
+    纯文本和文件请求统一走本函数。审批等级由 Agent 的安全设置决定；存在
+    文件时，content 中额外携带
     ``{"type": "file", "file_url": "file://...", "filename": ...}``
     块。QwenPaw 的 MediaProcessHook 会在执行前把 file:// 块解析为本地路径，
     并向 Agent 注入"用户上传文件，已经下载到 <path>"提示。
@@ -758,11 +818,33 @@ async def _stream_agent_request(
         # 运维助手请求必须归入自己的频道，不能落入 get_ctx 的 console 默认值。
         channel=channel.channel,
         agent_id=channel.agent_id,
-        # 运维助手属于受信任的自动化回调频道，工具调用不进入人工审批流程。
-        request_context={"approval_level": "off"},
     )
     async for event in workspace.stream_query(request):
         yield event
+
+
+async def _owned_pending_approvals(
+    payload: QwenPawChatRequest,
+    channel: Any,
+) -> list[Any]:
+    """读取属于当前外部聊天身份及会话树的待审批记录。"""
+    from qwenpaw.app.approvals import get_approval_service
+
+    service = get_approval_service()
+    by_root = getattr(service, "get_pending_by_root_session", None)
+    pending = (
+        await by_root(payload.session_id)
+        if by_root is not None
+        else await service.list_pending_by_session(payload.session_id)
+    )
+    return [
+        item
+        for item in pending
+        if item.root_session_id == payload.session_id
+        and item.owner_agent_id == channel.agent_id
+        and item.user_id == payload.user_id
+        and item.channel == channel.channel
+    ]
 
 
 async def _ensure_visible_chat(
@@ -883,8 +965,8 @@ async def _stream_agent(
 ):
     """流式调用 Agent，并把每个文本增量立即转换为 AG-UI SSE。
 
-    纯文本和文件请求统一构造 AgentRequest，并固定关闭工具审批；事件转换逻辑
-    共用。
+    纯文本和文件请求统一构造 AgentRequest。等待工具审批期间轮询当前会话树，
+    将待审批记录转换为 AG-UI ``CUSTOM/APPROVAL`` 事件。
     """
 
     # 一次请求对应一个 run；一次助手回答对应一个 message。
@@ -904,6 +986,7 @@ async def _stream_agent(
         "sessionId": payload.session_id,
     }
     bridge = _AgUiStreamBridge(run_id, metadata, channel)
+    known_approvals: set[str] = set()
     try:
         # 第一个事件表示本次 Agent 执行已经开始。ACTIVE_RUNS 已经先登记，
         # 因此调用方一收到 runId 就可以立即使用停止接口。
@@ -931,18 +1014,47 @@ async def _stream_agent(
         # 限制整个 Agent 流的最大处理时间。每个 QwenPaw 原生事件都会立即
         # 转换成对应的思考、工具调用、工具结果或回答 AG-UI 事件。
         async with asyncio.timeout(channel.agent_timeout_seconds):
-            async for event in _stream_agent_request(
+            source = _stream_agent_request(
                 payload,
                 channel,
                 ctx,
                 prompt,
                 file_entries or [],
-            ):
-                for agui_event in bridge.convert(event):
-                    yield _sse(agui_event)
-                final_text = _completed_answer(event)
-                if final_text:
-                    completed_answer = final_text
+            )
+            next_event: asyncio.Task[Any] | None = asyncio.create_task(
+                anext(source),
+            )
+            try:
+                while next_event is not None:
+                    done, _ = await asyncio.wait(
+                        {next_event},
+                        timeout=0.25,
+                    )
+                    pending = await _owned_pending_approvals(payload, channel)
+                    for approval_event in _approval_custom_events(
+                        bridge,
+                        pending,
+                        known_approvals,
+                    ):
+                        yield _sse(approval_event)
+                    if not done:
+                        continue
+                    try:
+                        event = next_event.result()
+                    except StopAsyncIteration:
+                        next_event = None
+                        break
+                    for agui_event in bridge.convert(event):
+                        yield _sse(agui_event)
+                    final_text = _completed_answer(event)
+                    if final_text:
+                        completed_answer = final_text
+                    next_event = asyncio.create_task(anext(source))
+            finally:
+                if next_event is not None and not next_event.done():
+                    next_event.cancel()
+                    await asyncio.gather(next_event, return_exceptions=True)
+                await source.aclose()
 
         # 某些兼容后端只返回最终完整文本；仍转换成标准 START/CONTENT/END。
         if not bridge.saw_assistant_content and completed_answer:
