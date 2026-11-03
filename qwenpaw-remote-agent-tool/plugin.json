@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "tool",
   "description": "让当前 Agent 调用其他 QwenPaw 服务中的指定 Agent，并取得最终回答。",
-  "author": "QwenPaw user plugin",
+  "author": "bzh",
   "entry": {
     "backend": "plugin.py"
   },

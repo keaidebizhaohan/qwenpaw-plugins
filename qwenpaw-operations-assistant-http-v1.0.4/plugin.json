@@ -4,7 +4,7 @@
   "version": "1.0.12",
   "type": "general",
   "description": "提供运维助手聊天和文件上传 HTTP API，不依赖频道启停状态。",
-  "author": "QwenPaw user plugin",
+  "author": "bzh",
   "entry": {
     "backend": "plugin.py"
   },

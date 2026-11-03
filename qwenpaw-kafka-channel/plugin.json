@@ -4,7 +4,7 @@
   "version": "1.8.0",
   "type": "channel",
   "description": "Consume upstream Kafka requests, invoke the Agent, and publish results to a downstream Kafka cluster.",
-  "author": "QwenPaw user plugin",
+  "author": "bzh",
   "entry": {
     "backend": "plugin.py"
   },

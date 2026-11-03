@@ -4,7 +4,7 @@
   "version": "1.0.2",
   "type": "tool",
   "description": "根据数据源范围调用市场或自定义数据源 SQL 查询接口。",
-  "author": "QwenPaw user plugin",
+  "author": "bzh",
   "entry": {
     "backend": "plugin.py"
   },

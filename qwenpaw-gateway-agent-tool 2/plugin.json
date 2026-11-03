@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "type": "tool",
   "description": "让当前 QwenPaw Agent 调用经 JiuwenSwarm Gateway 发布到 Kubernetes 的 Agent，并取得最终回答。",
-  "author": "QwenPaw user plugin",
+  "author": "bzh",
   "entry": {
     "backend": "plugin.py"
   },
