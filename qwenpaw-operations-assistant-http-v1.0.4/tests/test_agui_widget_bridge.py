@@ -535,6 +535,60 @@ class AgUiWidgetBridgeTest(unittest.TestCase):
         self.assertIsNone(getattr(workspace.request, "request_context", None))
         self.assertEqual(workspace.request.channel, "operations-assistant")
 
+    def test_agent_request_forwards_explicit_approval_level(self):
+        class FakeWorkspace:
+            def __init__(self):
+                self.request = None
+
+            async def stream_query(self, request):
+                self.request = request
+                if False:
+                    yield None
+
+        workspace = FakeWorkspace()
+
+        class FakeContext:
+            async def _get_workspace(self):
+                return workspace
+
+        payload = HTTP_API.QwenPawChatRequest(
+            userId="user-1",
+            sessionId="session-1",
+            input=[],
+            request_context={"approval_level": "smart"},
+        )
+        channel = SimpleNamespace(
+            channel="operations-assistant",
+            agent_id="agent-1",
+        )
+
+        async def run():
+            return [
+                event
+                async for event in HTTP_API._stream_agent_request(
+                    payload,
+                    channel,
+                    FakeContext(),
+                    "查询 CPU",
+                    [],
+                )
+            ]
+
+        self.assertEqual(asyncio.run(run()), [])
+        self.assertEqual(
+            workspace.request.request_context,
+            {"approval_level": "SMART"},
+        )
+
+    def test_empty_request_context_has_no_approval_override(self):
+        payload = HTTP_API.QwenPawChatRequest(
+            userId="user-1",
+            sessionId="session-1",
+            input=[],
+            request_context={},
+        )
+        self.assertIsNone(payload.request_context.approval_level)
+
     def test_approval_uses_custom_event_without_widget_tag(self):
         bridge = make_bridge()
         pending = SimpleNamespace(

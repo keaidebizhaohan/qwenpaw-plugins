@@ -36,7 +36,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from qwenpaw.pawapp import get_ctx
 
@@ -53,6 +53,27 @@ router = APIRouter()
 # 找到全部任务并取消；runId 仍会出现在 SSE 事件中供调用方追踪。
 ACTIVE_RUNS: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
 
+_APPROVAL_LEVELS = frozenset({"OFF", "AUTO", "SMART", "STRICT", "JEV"})
+
+
+class ChatRequestContext(BaseModel):
+    """允许外部聊天按本次请求覆盖工具审批等级。"""
+
+    model_config = ConfigDict(extra="ignore")
+    approval_level: Optional[str] = None
+
+    @field_validator("approval_level")
+    @classmethod
+    def normalize_approval_level(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip().upper()
+        if normalized not in _APPROVAL_LEVELS:
+            raise ValueError(
+                "approval_level must be OFF, AUTO, SMART, STRICT, or JEV",
+            )
+        return normalized
+
 
 class QwenPawChatRequest(BaseModel):
     """外部服务调用聊天回调时提交的 QwenPaw 格式请求体。"""
@@ -68,6 +89,10 @@ class QwenPawChatRequest(BaseModel):
 
     # QwenPaw 消息数组，当前实现从中选取最后一条 user 文本消息。
     input: list[dict[str, Any]]
+
+    # 可选的单次聊天审批等级。不传或传空对象时不向 QwenPaw 传
+    # request_context，由 Agent 配置决定审批等级。
+    request_context: Optional[ChatRequestContext] = None
 
     # true（默认）实时转发 AG-UI SSE；false 等待 QwenPaw 最终
     # AgentResponse，再通过 SSE 输出最多一条思考 Chunk 和一条回答 Chunk。
@@ -1065,6 +1090,15 @@ async def _stream_agent_request(
             },
         )
 
+    request_kwargs: dict[str, Any] = {}
+    if (
+        payload.request_context is not None
+        and payload.request_context.approval_level is not None
+    ):
+        request_kwargs["request_context"] = {
+            "approval_level": payload.request_context.approval_level,
+        }
+
     request = AgentRequest(
         input=[
             {
@@ -1077,6 +1111,7 @@ async def _stream_agent_request(
         # 运维助手请求必须归入自己的频道，不能落入 get_ctx 的 console 默认值。
         channel=channel.channel,
         agent_id=channel.agent_id,
+        **request_kwargs,
     )
     async for event in workspace.stream_query(request):
         yield event

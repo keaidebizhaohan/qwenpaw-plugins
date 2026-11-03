@@ -24,6 +24,30 @@
 Bearer Token。Agent 超时固定为 1800 秒，单文件上传上限固定为 1024 MB；
 思考、工具调用和工具结果使用插件内置输出策略。
 
+聊天请求可选地携带本次调用的审批等级：
+
+```json
+{
+  "userId": "user-1",
+  "sessionId": "session-1",
+  "stream": true,
+  "request_context": {
+    "approval_level": "SMART"
+  },
+  "input": [
+    {
+      "role": "user",
+      "type": "message",
+      "content": [{"type": "text", "text": "查询服务器状态"}]
+    }
+  ]
+}
+```
+
+`approval_level` 支持 `OFF`、`AUTO`、`SMART`、`STRICT`、`JEV`，大小写
+不敏感。省略 `request_context`、传空对象或不传 `approval_level` 时，插件
+不会向 QwenPaw 添加 `request_context`，审批等级继承 Agent 配置。
+
 Agent 成功调用 `write_file`、`edit_file`、`append_file` 或
 `send_file_to_user` 后，聊天 SSE 会额外输出：
 
