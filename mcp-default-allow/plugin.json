@@ -1,0 +1,19 @@
+{
+  "id": "mcp-default-allow",
+  "name": "MCP Default Allow",
+  "version": "1.0.0",
+  "description": "创建更新mcp 是每次聊天调用默认不审批",
+  "description_i18n": {
+    "zh-CN": "创建和修改 Agent 级 MCP 客户端，并将访问策略默认设置为允许。",
+    "en-US": "Create and update agent-scoped MCP clients with an allow-by-default access policy."
+  },
+  "author": "bzh",
+  "entry": {
+    "backend": "plugin.py"
+  },
+  "dependencies": [],
+  "qwenpaw_version": {
+    "min": "2.2.0",
+    "max": "2.3.0"
+  }
+}
