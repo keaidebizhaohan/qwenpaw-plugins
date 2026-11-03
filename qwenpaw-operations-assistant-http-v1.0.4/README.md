@@ -12,12 +12,30 @@
   一帧 `TEXT_MESSAGE_CHUNK`；
 - `POST /api/service-channel/chat/stop?agentId=<agentId>`，请求体为
   `{"sessionId":"..."}`；停止该会话下全部运行中的聊天；
-- `POST /api/service-channel/files?agentId=<agentId>`
+- `POST /api/service-channel/files?agentId=<agentId>`：以 multipart/form-data
+  上传 `file`，返回 `{"file_url":"服务器内绝对路径","name":"文件名","size":字节数}`；
+  聊天时使用 `{"type":"file","file_url":"上传返回的 file_url"}` 引用该文件；
+- `GET /api/service-channel/files/download?agentId=<agentId>&path=<文件路径>`：
+  下载 Agent 通过 `send_file_to_user` 生成的文件；只允许读取该 Agent 的
+  Workspace 内文件。
 
 健康检查接口由“运维助手频道”插件提供。每次聊天或上传请求都根据
 `agentId` 直接取得对应 Agent Workspace，不读取频道配置，也不校验回调
 Bearer Token。Agent 超时固定为 1800 秒，单文件上传上限固定为 1024 MB；
 思考、工具调用和工具结果使用插件内置输出策略。
+
+Agent 成功调用 `write_file`、`edit_file`、`append_file` 或
+`send_file_to_user` 后，聊天 SSE 会额外输出：
+
+```text
+data: {"type":"CUSTOM","name":"FILE","value":{"path":"/app/working/workspaces/default/咏梅.txt","name":"咏梅.txt"}}
+```
+
+`value.path` 是 Agent 生成文件的原始路径。调用方下载时，将该值作为
+`GET /api/service-channel/files/download` 的 `path` 参数，并同时传入
+`agentId`。流式和 `stream=false` 两种聊天模式都会生成该事件。
+如果工具入参使用相对路径，插件会按照当前 Agent 的主项目目录解析后，
+在 `value.path` 中返回完整绝对路径。
 
 Agent 触发工具审批时，`stream=true` 的聊天流会输出 AG-UI 自定义事件：
 

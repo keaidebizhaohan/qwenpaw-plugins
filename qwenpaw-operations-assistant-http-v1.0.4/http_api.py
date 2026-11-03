@@ -8,8 +8,8 @@
 - POST /chat：无论 ``stream`` 为 true 还是 false 都返回 AG-UI SSE；
   ``stream=false`` 会等待 Agent 完成后，再一次性逐帧输出完整思考和最终回答；
 - POST /chat/stop：按 Agent ID 和 Session ID 停止运行中的聊天；
-- POST /files：multipart 文件上传，返回 fileId 供聊天引用；
-- /chat 的 input 中支持 ``{"type": "file", "fileId": ...}`` 内容块；
+- POST /files：multipart 文件上传，返回服务器内 file_url 供聊天引用；
+- /chat 的 input 中支持 ``{"type": "file", "file_url": ...}`` 内容块；
   携带文件块时改走 ``workspace.stream_query(AgentRequest)`` 路径，
   其余请求行为与 2.7.0 完全一致。
 """
@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -34,17 +35,12 @@ from fastapi import (
     Query,
     UploadFile,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from qwenpaw.pawapp import get_ctx
 
-from .storage import (
-    FileResolveError,
-    register_uploaded_file,
-    resolve_file_block,
-    sanitize_filename,
-)
+from .storage import sanitize_filename
 from .widget_stream import ParsedPart, WidgetStreamParser
 
 logger = logging.getLogger(__name__)
@@ -189,13 +185,13 @@ def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _extract_file_ids(messages: list[dict[str, Any]]) -> list[str]:
-    """按顺序收集 input 中所有 file 块引用的 fileId（去重保序）。
+def _extract_file_paths(messages: list[dict[str, Any]]) -> list[str]:
+    """按顺序收集 input 中所有 file 块引用的 file_url（去重保序）。
 
-    文件块格式：``{"type": "file", "fileId": "<上传接口返回的 ID>"}``。
+    文件块格式：``{"type": "file", "file_url": "<上传返回值>"}``。
     其他类型的块、非用户消息和格式不完整的块都会被忽略。
     """
-    file_ids: list[str] = []
+    file_paths: list[str] = []
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
@@ -203,15 +199,19 @@ def _extract_file_ids(messages: list[dict[str, Any]]) -> list[str]:
         if not isinstance(content, list):
             continue
         for part in content:
-            file_id = (
-                part.get("fileId")
+            file_path = (
+                part.get("file_url")
                 if isinstance(part, dict)
                 and part.get("type") == "file"
                 else None
             )
-            if isinstance(file_id, str) and file_id and file_id not in file_ids:
-                file_ids.append(file_id)
-    return file_ids
+            if (
+                isinstance(file_path, str)
+                and file_path.strip()
+                and file_path not in file_paths
+            ):
+                file_paths.append(file_path)
+    return file_paths
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -289,6 +289,200 @@ def _tool_result_content(data: dict[str, Any], limit: int) -> str:
     return _text_preview(value, limit)
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    """把工具 arguments 的 JSON 字符串或字典统一转换为字典。"""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+_FILE_ARTIFACT_TOOLS = {
+    "writefile",
+    "editfile",
+    "appendfile",
+    "sendfiletouser",
+}
+
+
+def _normalized_tool_name(value: Any) -> str:
+    """使用与 QwenPaw 页面一致的方式规范化工具名。"""
+    return "".join(character for character in str(value or "") if character.isalnum()).lower()
+
+
+def _artifact_file_call(data: dict[str, Any]) -> tuple[str, str]:
+    """从页面支持的文件工具参数中读取规范化工具名和文件路径。"""
+    tool_name = _normalized_tool_name(data.get("name"))
+    if tool_name not in _FILE_ARTIFACT_TOOLS:
+        return "", ""
+    arguments = _json_object(data.get("arguments"))
+    file_path = arguments.get("file_path")
+    return tool_name, str(file_path).strip() if file_path else ""
+
+
+def _resolve_artifact_file_path(
+    file_path: str,
+    project_dir: str | Path | None,
+) -> str:
+    """按 QwenPaw 工具相同语义把相对文件路径解析到主项目目录。"""
+    path = Path(file_path).expanduser()
+    if path.is_absolute() or not project_dir:
+        return str(path)
+    return str((Path(project_dir).expanduser() / path).resolve())
+
+# 这次文件工具调用是否真的成功生成了一个可以下载的文件？
+def _tool_result_created_file(
+    data: dict[str, Any],
+    tool_name: str,
+) -> bool:
+    """按 QwenPaw 页面规则确认文件工具是否成功生成可下载文件。"""
+    if not _tool_result_succeeded(data.get("state")):
+        return False
+    # write/edit/append 的成功结果只有文本描述，没有 DataBlock。页面也是根据
+    # 工具名和成功 state 直接显示这些文件。
+    if tool_name in {"writefile", "editfile", "appendfile"}:
+        return True
+    if tool_name != "sendfiletouser":
+        return False
+
+    # send_file_to_user 即使失败也可能返回 state=success，只有实际 DataBlock
+    # 才代表文件真的发送成功；DataBlock 既可能是 file URL，也可能是 base64。
+    output = data.get("output")
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "data":
+            continue
+        if isinstance(item, dict) and item.get("type") == "data":
+            return True
+    return False
+
+
+def _tool_result_text(data: dict[str, Any]) -> str:
+    """读取工具结果中的文本，兼容纯字符串和序列化 Block 数组。"""
+    output = data.get("output")
+    if isinstance(output, str):
+        try:
+            parsed = json.loads(output)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return output
+        output = parsed
+    if not isinstance(output, list):
+        return str(output or "")
+    return "\n".join(
+        str(item.get("text"))
+        for item in output
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and item.get("text")
+    )
+
+
+def _actual_file_path_from_result(
+    data: dict[str, Any],
+    tool_name: str,
+    fallback_path: str,
+) -> str:
+    """优先从文件工具执行结果读取其真正操作的绝对路径。"""
+    text = _tool_result_text(data).strip()
+    patterns = {
+        "writefile": r"^Wrote\s+\d+\s+bytes\s+to\s+(.+)\.$",
+        "appendfile": r"^Appended\s+\d+\s+bytes\s+to\s+(.+)\.$",
+        "editfile": r"^Successfully replaced text in\s+(.+)\.$",
+    }
+    pattern = patterns.get(tool_name)
+    if pattern:
+        matched = re.match(pattern, text, flags=re.DOTALL)
+        if matched:
+            result_path = matched.group(1).strip()
+            if result_path:
+                return result_path
+    return fallback_path
+
+
+def _file_custom_event(
+    file_path: str,
+    event_factory: Any = _event,
+) -> dict[str, Any]:
+    """把 Agent 生成的文件转换为约定的 CUSTOM/FILE 事件。"""
+    return event_factory(
+        "CUSTOM",
+        name="FILE",
+        value={
+            # 这里只返回 Agent 生成文件的原始路径。调用方下载时再把该值作为
+            # path 参数传给 /api/service-channel/files/download。
+            "path": file_path,
+            "name": Path(file_path).name,
+        },
+    )
+
+
+def _completed_file_events(
+    response: Any,
+    project_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """从最终 AgentResponse 配对文件工具调用和成功结果。"""
+    output = _value(response, "output", [])
+    if not isinstance(output, list):
+        return []
+
+    calls: dict[str, tuple[str, str]] = {}
+    successful_call_ids: list[str] = []
+    for message in output:
+        message_type = str(_enum_value(_value(message, "type")) or "")
+        content = _value(message, "content", [])
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if str(_enum_value(_value(item, "type")) or "") != "data":
+                continue
+            data = _as_dict(_value(item, "data", {}))
+            call_id = str(data.get("call_id") or "")
+            if not call_id:
+                continue
+            if message_type == "plugin_call":
+                tool_name, file_path = _artifact_file_call(data)
+                if file_path:
+                    calls[call_id] = (
+                        tool_name,
+                        _resolve_artifact_file_path(file_path, project_dir),
+                    )
+            elif (
+                message_type == "plugin_call_output"
+                and call_id in calls
+                and _tool_result_created_file(data, calls[call_id][0])
+            ):
+                tool_name, fallback_path = calls[call_id]
+                calls[call_id] = (
+                    tool_name,
+                    _actual_file_path_from_result(
+                        data,
+                        tool_name,
+                        fallback_path,
+                    ),
+                )
+                successful_call_ids.append(call_id)
+
+    events: list[dict[str, Any]] = []
+    emitted: set[str] = set()
+    for call_id in successful_call_ids:
+        if call_id in emitted:
+            continue
+        emitted.add(call_id)
+        events.append(_file_custom_event(calls[call_id][1]))
+    return events
+
+
 class _AgUiStreamBridge:
     """把 QwenPaw 原生流事件逐条转换为外部服务使用的 AG-UI 事件。"""
 
@@ -305,11 +499,15 @@ class _AgUiStreamBridge:
         self.tool_result_max_length = int(
             getattr(display, "tool_result_max_length", 500),
         )
+        self.project_dir = getattr(channel, "project_dir", None)
         self.message_types: dict[str, str] = {}
         self.active_thinking: set[str] = set()
         self.active_text: set[str] = set()
         self.tool_calls: dict[str, dict[str, Any]] = {}
         self.tool_results: dict[str, dict[str, Any]] = {}
+        # send_file_to_user 的调用参数和结果分属两条 message，用 call_id 配对。
+        self.file_calls: dict[str, tuple[str, str]] = {}
+        self.emitted_file_calls: set[str] = set()
         self.answer_parts: list[str] = []
         self.last_answer_message_id = ""
         # 每条助手消息独立维护标签解析状态，支持标签跨任意文本分片。
@@ -460,7 +658,21 @@ class _AgUiStreamBridge:
                             ),
                         )
         elif not is_delta:
-            if not state["args"] and arguments and self.show_tool_calls:
+            had_streamed_arguments = bool(state["args"])
+            full_arguments = str(state["args"] or arguments)
+            state["args"] = full_arguments
+            tool_name, file_path = _artifact_file_call(
+                {"name": name, "arguments": full_arguments},
+            )
+            if file_path:
+                self.file_calls[call_id] = (
+                    tool_name,
+                    _resolve_artifact_file_path(
+                        file_path,
+                        self.project_dir,
+                    ),
+                )
+            if not had_streamed_arguments and arguments and self.show_tool_calls:
                 events.append(
                     self.event(
                         "TOOL_CALL_ARGS",
@@ -490,7 +702,7 @@ class _AgUiStreamBridge:
         tool_state = data.get("state")
         succeeded = _tool_result_succeeded(tool_state)
         content = _tool_result_content(data, self.tool_result_max_length)
-        return [
+        events = [
             self.event(
                 "TOOL_CALL_RESULT",
                 toolCallId=str(data.get("call_id") or message_id),
@@ -504,6 +716,27 @@ class _AgUiStreamBridge:
                 },
             ),
         ]
+        call_id = str(data.get("call_id") or message_id)
+        tool_name, file_path = self.file_calls.get(call_id, ("", ""))
+        if (
+            file_path
+            and call_id not in self.emitted_file_calls
+            and _tool_result_created_file(data, tool_name)
+        ):
+            file_path = _actual_file_path_from_result(
+                data,
+                tool_name,
+                file_path,
+            )
+            self.file_calls[call_id] = (tool_name, file_path)
+            self.emitted_file_calls.add(call_id)
+            events.append(
+                _file_custom_event(
+                    file_path,
+                    self.event,
+                ),
+            )
+        return events
 
     def _embedded_data_events(
         self,
@@ -553,6 +786,20 @@ class _AgUiStreamBridge:
         object_type = _value(raw_event, "object")
         item_type = str(_enum_value(_value(raw_event, "type")) or "")
         status = str(_enum_value(_value(raw_event, "status")) or "")
+
+        if object_type == "response":
+            # 最终 AgentResponse 会再次携带全部工具消息。工具状态本身负责去重，
+            # 因而这里既能补齐后端没有逐条流出的文件事件，也不会重复发送。
+            events: list[dict[str, Any]] = []
+            output = _value(raw_event, "output", [])
+            if isinstance(output, list):
+                for message in output:
+                    message_type = str(
+                        _enum_value(_value(message, "type")) or "",
+                    )
+                    if message_type in {"plugin_call", "plugin_call_output"}:
+                        events.extend(self.convert(message))
+            return events
 
         if object_type == "message":
             message_id = str(_value(raw_event, "id") or "")
@@ -681,7 +928,10 @@ def _completed_message_text(message: Any) -> str:
     return "".join(parts).strip()
 
 
-def _non_stream_agui_events(response: Any) -> list[dict[str, Any]]:
+def _non_stream_agui_events(
+    response: Any,
+    project_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
     """把 QwenPaw 最终 AgentResponse 压缩为一到两条 AG-UI Chunk。
 
     所有 reasoning 消息合并成第一条 REASONING_MESSAGE_CHUNK；最后一条完整
@@ -727,6 +977,7 @@ def _non_stream_agui_events(response: Any) -> list[dict[str, Any]]:
                 delta="\n".join(reasoning_parts),
             ),
         )
+    events.extend(_completed_file_events(response, project_dir))
     if answer:
         events.append(
             _event(
@@ -751,6 +1002,13 @@ async def _get_runtime(agent_id: str, ctx: Any) -> Any:
         raise HTTPException(status_code=404, detail="Agent workspace not found")
 
     agent_config = getattr(workspace, "config", None)
+    try:
+        from qwenpaw.app.agent_context import get_agent_project_dir
+
+        project_dir = get_agent_project_dir(workspace)
+    except Exception:
+        # 兼容没有新项目目录服务的 QwenPaw 版本；旧版本至少提供 workspace_dir。
+        project_dir = getattr(workspace, "workspace_dir", None)
     # HTTP 插件没有配置页面，也不读取频道配置。以下值是插件固定策略：
     # 完整输出思考、工具调用与结果；单次 Agent 最长 30 分钟；单文件 1 GB。
     display = SimpleNamespace(
@@ -767,6 +1025,7 @@ async def _get_runtime(agent_id: str, ctx: Any) -> Any:
         agent_name=str(getattr(agent_config, "name", "") or agent_id),
         agent_timeout_seconds=1800,
         max_upload_mb=1024,
+        project_dir=project_dir,
         _display_config=display,
         workspace=workspace,
     )
@@ -921,7 +1180,10 @@ async def _non_stream_agent(
                 detail="QwenPaw did not return a final AgentResponse",
             )
 
-        events = _non_stream_agui_events(final_response)
+        events = _non_stream_agui_events(
+            final_response,
+            getattr(channel, "project_dir", None),
+        )
         if not any(event["type"] == "TEXT_MESSAGE_CHUNK" for event in events):
             raise HTTPException(
                 status_code=502,
@@ -1163,19 +1425,20 @@ async def chat(
     if request_agent_id != channel.agent_id:
         raise HTTPException(status_code=409, detail="Callback Agent binding mismatch")
 
-    # 4. 解析 input 中的文件块引用，并校验 fileId 归属。
-    # 校验在返回 StreamingResponse 之前完成，失败时调用方收到普通 JSON 错误。
+    # 4. 解析 input 中的文件路径，并限制在当前 Agent Workspace 或 QwenPaw
+    #    工作目录内。校验在返回 StreamingResponse 之前完成，失败时调用方收到
+    #    普通 JSON 错误。
     file_entries: list[dict[str, Any]] = []
-    for file_id in _extract_file_ids(payload.input):
-        try:
-            file_entries.append(
-                resolve_file_block(file_id, channel.agent_id, payload.user_id),
-            )
-        except FileResolveError as exc:
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=exc.detail,
-            ) from exc
+    for file_path in _extract_file_paths(payload.input):
+        target = _resolve_agent_download_file(channel, file_path)
+        file_entries.append(
+            {
+                "path": target,
+                "filename": target.name,
+                "size": target.stat().st_size,
+                "agent_id": channel.agent_id,
+            },
+        )
 
     # 5. 文本与文件至少要有一样；纯文本请求与 2.7.0 行为完全一致。
     if not _latest_user_text(payload.input) and not file_entries:
@@ -1183,7 +1446,7 @@ async def chat(
             status_code=400,
             detail=(
                 "input must contain a non-empty user text message "
-                "or a valid fileId file block"
+                "or a valid file_url file block"
             ),
         )
     # 6. 非流式模式先在当前请求中等待 QwenPaw 执行完成，但对外仍使用 SSE。
@@ -1244,6 +1507,78 @@ async def stop_chat(
     return response
 
 
+def _resolve_agent_download_file(channel: Any, file_path: str) -> Path:
+    """解析下载目标，并限制在 Agent Workspace 或 QwenPaw 工作目录内。"""
+    workspace_dir = getattr(channel.workspace, "workspace_dir", None)
+    if not workspace_dir:
+        raise HTTPException(
+            status_code=404,
+            detail="Agent workspace is not available for file download",
+        )
+
+    workspace_root = Path(workspace_dir).expanduser().resolve()
+    project_root = Path(
+        getattr(channel, "project_dir", None) or workspace_root,
+    ).expanduser().resolve()
+    allowed_roots = [workspace_root]
+    if project_root not in allowed_roots:
+        allowed_roots.append(project_root)
+    try:
+        from qwenpaw.constant import WORKING_DIR
+
+        working_root = Path(WORKING_DIR).expanduser().resolve()
+        if working_root not in allowed_roots:
+            allowed_roots.append(working_root)
+    except Exception:  # pragma: no cover - 兼容精简版 QwenPaw 运行环境
+        pass
+
+    candidate = Path(file_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = project_root / candidate
+    try:
+        target = candidate.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid file path",
+        ) from exc
+    if not any(
+        target == root or target.is_relative_to(root)
+        for root in allowed_roots
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Requested file is outside the QwenPaw working directory",
+        )
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return target
+
+
+@router.get("/files/download")
+async def download_file(
+    agent_id: str = Query(alias="agentId", min_length=1),
+    path: str = Query(min_length=1),
+    ctx: Any = Depends(get_ctx),
+) -> FileResponse:
+    """下载 Agent 通过 send_file_to_user 生成的 Workspace 文件。
+
+    ``agentId`` 用来定位并校验 Agent Workspace；``path`` 可以是 CUSTOM/FILE
+    事件对应的绝对文件路径，也可以是相对于 Workspace 的路径。
+    """
+    channel = await _get_runtime(agent_id, ctx)
+    target = _resolve_agent_download_file(channel, path)
+    return FileResponse(
+        path=target,
+        filename=target.name,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
 @router.post("/files")
 async def upload_file(
     agent_id: str = Query(alias="agentId", min_length=1),
@@ -1252,19 +1587,19 @@ async def upload_file(
     session_id: Optional[str] = Form(default=None, alias="sessionId"),
     ctx: Any = Depends(get_ctx),
 ) -> dict[str, Any]:
-    """上传文件接口，返回可被 /chat 引用的 fileId。
+    """上传文件接口，返回可被 /chat 直接引用的服务器内路径。
 
     请求为 multipart/form-data：
 
     - ``file``（必填）：上传的文件内容；
-    - ``userId``（可选）：记录文件归属用户；填写后 /chat 引用该文件时
-      必须携带相同的 userId，否则返回 403；
-    - ``sessionId``（可选）：仅记录用途，不参与校验。
+    - ``userId``（可选）：兼容旧调用方，路径模式不参与文件校验；
+    - ``sessionId``（可选）：兼容旧调用方，路径模式不参与文件校验。
 
-    返回 ``{"fileId", "filename", "size"}``。HTTP 插件不校验回调 Token。
-    ``del session_id`` 仅表示当前版本不把它写入注册表。
+    返回 ``{"file_url", "name", "size"}``。聊天文件块直接传入返回的
+    file_url。
+    HTTP 插件不校验回调 Token。
     """
-    del session_id
+    del user_id, session_id
 
     # 1. 直接定位 Agent Workspace，与频道运行状态无关。
     channel = await _get_runtime(agent_id, ctx)
@@ -1287,12 +1622,12 @@ async def upload_file(
         )
 
     # 4. 分块写盘并统计大小，超过 max_upload_mb 时删除半成品并返回 413。
-    file_id = uuid.uuid4().hex
+    upload_dir_name = uuid.uuid4().hex
     dest_dir = (
         Path(workspace_dir).expanduser()
         / "media"
         / "service-channel"
-        / file_id
+        / upload_dir_name
     )
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / safe_name
@@ -1319,20 +1654,13 @@ async def upload_file(
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    # 5. 登记进进程内注册表，等待 /chat 引用。
-    register_uploaded_file(
-        file_id=file_id,
-        path=dest,
-        filename=safe_name,
-        size=size,
-        agent_id=agent_id,
-        user_id=user_id,
-    )
+    # 5. 通过 file_url 返回可直接用于 /chat 的绝对路径，不创建内存映射。
+    resolved_dest = dest.resolve()
     logger.info(
-        "Operations Assistant file uploaded: agent=%s file=%s size=%d owner=%s",
+        "Operations Assistant file uploaded: agent=%s file=%s size=%d path=%s",
         agent_id,
         safe_name,
         size,
-        (user_id or "").strip() or "<any user>",
+        resolved_dest,
     )
-    return {"fileId": file_id, "filename": safe_name, "size": size}
+    return {"file_url": str(resolved_dest), "name": safe_name, "size": size}
